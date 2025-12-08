@@ -167,6 +167,9 @@ class JobStatus(str, Enum):
 # In-memory job storage (could be replaced with Redis/MongoDB for production)
 extraction_jobs = {}
 job_lock = threading.Lock()
+backup_lock = threading.Lock()  # Lock to prevent concurrent ChromaDB backups
+extraction_in_progress = False  # Flag to track if extraction is in progress
+extraction_lock = threading.Lock()  # Lock to protect extraction_in_progress flag
 
 
 @app.head("/health")
@@ -203,13 +206,53 @@ else:
 # Initialize S3 client (with error handling) - MUST be before ChromaDB restore
 aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
 aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-aws_region = os.getenv("AWS_REGION", "us-east-1")
+aws_region = os.getenv("AWS_REGION", "ap-south-1")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "alliancewidget")
+
+def get_bucket_region(bucket_name, access_key, secret_key, default_region):
+    """Get the actual region of an S3 bucket."""
+    try:
+        # Create a temporary client with default region to get bucket location
+        temp_client = boto3.client(
+            's3',
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=default_region
+        )
+        # Get bucket location (returns 'us-east-1' as None or the actual region)
+        response = temp_client.get_bucket_location(Bucket=bucket_name)
+        location = response.get('LocationConstraint')
+        # If location is None or empty, it means us-east-1
+        if location is None or location == '':
+            return 'ap-south-1'
+        return location
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        # If bucket doesn't exist or access denied, return default
+        if error_code in ['NoSuchBucket', 'AccessDenied', '403']:
+            print(f"  ⚠ Could not detect bucket region ({error_code}), using configured: {default_region}")
+            return default_region
+        # For other errors, try common regions
+        print(f"  ⚠ Error detecting bucket region: {e}")
+        return default_region
+    except Exception as e:
+        print(f"  ⚠ Could not detect bucket region: {e}, using configured: {default_region}")
+        return default_region
 
 if not aws_access_key or not aws_secret_key:
     print("\n⚠️  WARNING: AWS credentials not found in .env file or environment!")
     print("The S3 upload functionality will not work without AWS credentials.")
     s3_client = None
 else:
+    # Detect the actual bucket region to avoid signature mismatches
+    print(f"\n🔍 Detecting S3 bucket region for '{S3_BUCKET_NAME}'...")
+    detected_region = get_bucket_region(S3_BUCKET_NAME, aws_access_key, aws_secret_key, aws_region)
+    if detected_region != aws_region:
+        print(f"  ✓ Bucket region detected: {detected_region} (was configured as: {aws_region})")
+        aws_region = detected_region
+    else:
+        print(f"  ✓ Using configured region: {aws_region}")
+    
     s3_client = boto3.client(
         's3',
         aws_access_key_id=aws_access_key,
@@ -217,7 +260,6 @@ else:
         region_name=aws_region
     )
 
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "alliancewidget")
 CHROMADB_S3_KEY = "chromadb_backup/chromadb.tar.gz"  # S3 key for ChromaDB backup
 CHROMADB_LOCAL_PATH = "./chroma_db"
 
@@ -264,12 +306,29 @@ def download_chromadb_from_s3():
         return False
 
 
-def upload_chromadb_to_s3():
-    """Upload ChromaDB directory to S3 as a backup."""
+def upload_chromadb_to_s3(skip_if_extraction_in_progress=False):
+    """
+    Upload ChromaDB directory to S3 as a backup.
+    
+    Args:
+        skip_if_extraction_in_progress: If True, skip backup if extraction is in progress
+    """
     if s3_client is None:
         return False
     
     if not os.path.exists(CHROMADB_LOCAL_PATH):
+        return False
+    
+    # Check if extraction is in progress and skip if requested
+    if skip_if_extraction_in_progress:
+        with extraction_lock:
+            if extraction_in_progress:
+                print(f"  ⏭️  Skipping ChromaDB backup (extraction in progress)")
+                return False
+    
+    # Acquire backup lock to prevent concurrent backups
+    if not backup_lock.acquire(blocking=False):
+        print(f"  ⏭️  Skipping ChromaDB backup (another backup in progress)")
         return False
     
     try:
@@ -296,6 +355,8 @@ def upload_chromadb_to_s3():
     except Exception as e:
         print(f"  ⚠ Failed to backup ChromaDB to S3: {str(e)}")
         return False
+    finally:
+        backup_lock.release()
 
 
 # Download ChromaDB from S3 on startup (if available)
@@ -330,11 +391,12 @@ if s3_client is not None:
 
 
 def periodic_chromadb_backup():
-    """Periodically backup ChromaDB to S3 every 5 minutes."""
+    """Periodically backup ChromaDB to S3 every 5 minutes. Skips if extraction is in progress."""
     while True:
         time.sleep(300)  # 5 minutes
         if s3_client is not None:
-            upload_chromadb_to_s3()
+            # Skip backup if extraction is in progress to avoid conflicts
+            upload_chromadb_to_s3(skip_if_extraction_in_progress=True)
 
 
 # Start periodic backup thread
@@ -1330,23 +1392,11 @@ def create_compiled_pdf_from_images(s3_image_urls, user_number, query):
             }
         )
         
-        # Generate presigned URL (valid for 1 hour) for Twilio to access
-        try:
-            compiled_pdf_url = s3_client.generate_presigned_url(
-                'get_object',
-                Params={
-                    'Bucket': S3_BUCKET_NAME,
-                    'Key': f"compiled_pdfs/{pdf_filename}"
-                },
-                ExpiresIn=3600  # URL valid for 1 hour
-            )
-            print(f" ✓ Uploaded")
-            print(f"  ✓ Compiled PDF URL (presigned): {compiled_pdf_url[:100]}...")
-        except Exception as presign_error:
-            # Fallback to regular URL if presigning fails
-            compiled_pdf_url = f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/compiled_pdfs/{pdf_filename}"
-            print(f" ✓ Uploaded")
-            print(f"  ⚠ Could not generate presigned URL, using regular URL: {compiled_pdf_url}")
+        # Generate direct S3 object URL (region-specific format)
+        # Format: https://{bucket}.s3.{region}.amazonaws.com/{key}
+        compiled_pdf_url = f"https://{S3_BUCKET_NAME}.s3.{aws_region}.amazonaws.com/compiled_pdfs/{pdf_filename}"
+        print(f" ✓ Uploaded")
+        print(f"  ✓ Compiled PDF URL: {compiled_pdf_url}")
         
         # Clean up temp file
         os.unlink(temp_pdf_path)
@@ -1368,6 +1418,11 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
         use_ocr: Whether to use OCR
         webhook_url: Optional webhook URL to notify when complete
     """
+    # Set extraction flag to prevent concurrent backups
+    global extraction_in_progress
+    with extraction_lock:
+        extraction_in_progress = True
+    
     try:
         with job_lock:
             extraction_jobs[job_id]["status"] = JobStatus.PROCESSING
@@ -1504,6 +1559,10 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
                 "error": error_msg
             }
             send_webhook_notification(webhook_url, job_id, failure_data)
+    finally:
+        # Always reset extraction flag when done
+        with extraction_lock:
+            extraction_in_progress = False
 
 
 @app.post("/extract")
@@ -1569,104 +1628,114 @@ async def extract_text(
         })
     
     # Synchronous processing (original behavior when no webhook)
-    print("\n" + "="*80)
-    print(f"🚀 Starting batch PDF extraction (synchronous)")
-    print(f"📁 Total files received: {len(files)}")
-    print(f"🔧 OCR enabled: {use_ocr}")
-    print(f"🔧 OCR available: {TESSERACT_FOUND}")
-    print("="*80)
+    # Set extraction flag to prevent concurrent backups
+    global extraction_in_progress
+    with extraction_lock:
+        extraction_in_progress = True
     
-    results = {}
-    errors = []
-    stored_count = 0
-    s3_upload_count = 0
-    pdf_s3_urls = {}  # Store full PDF S3 URLs by filename
-    
-    for idx, file in enumerate(files, 1):
-        print(f"\n📦 Processing file {idx}/{len(files)}: {file.filename}")
+    try:
+        print("\n" + "="*80)
+        print(f"🚀 Starting batch PDF extraction (synchronous)")
+        print(f"📁 Total files received: {len(files)}")
+        print(f"🔧 OCR enabled: {use_ocr}")
+        print(f"🔧 OCR available: {TESSERACT_FOUND}")
+        print("="*80)
         
-        if not file.filename.lower().endswith('.pdf'):
-            error_msg = f"{file.filename}: Not a PDF file"
-            errors.append(error_msg)
-            print(f"  ❌ {error_msg}")
-            continue
+        results = {}
+        errors = []
+        stored_count = 0
+        s3_upload_count = 0
+        pdf_s3_urls = {}  # Store full PDF S3 URLs by filename
         
-        try:
-            print(f"  📥 Reading file contents...")
-            contents = await file.read()
-            print(f"  ✓ File size: {len(contents)} bytes")
-    
-            # Upload full PDF to S3 first
-            full_pdf_s3_url = upload_full_pdf_to_s3(contents, file.filename)
-            if full_pdf_s3_url:
-                pdf_s3_urls[file.filename] = full_pdf_s3_url
-    
-            # Extract text
-            extracted_text, page_objects, doc = extract_text_from_pdf(contents, file.filename, use_ocr)
+        for idx, file in enumerate(files, 1):
+            print(f"\n📦 Processing file {idx}/{len(files)}: {file.filename}")
             
-            # Store each page in ChromaDB and upload to S3
-            pdf_name = Path(file.filename).stem
-            print(f"\n  💾 Storing pages in ChromaDB and uploading to S3...")
+            if not file.filename.lower().endswith('.pdf'):
+                error_msg = f"{file.filename}: Not a PDF file"
+                errors.append(error_msg)
+                print(f"  ❌ {error_msg}")
+                continue
             
-            for page_identifier, text in extracted_text.items():
-                # Extract page number from identifier
-                page_number = int(page_identifier.split('&')[1])
+            try:
+                print(f"  📥 Reading file contents...")
+                contents = await file.read()
+                print(f"  ✓ File size: {len(contents)} bytes")
+        
+                # Upload full PDF to S3 first
+                full_pdf_s3_url = upload_full_pdf_to_s3(contents, file.filename)
+                if full_pdf_s3_url:
+                    pdf_s3_urls[file.filename] = full_pdf_s3_url
+        
+                # Extract text
+                extracted_text, page_objects, doc = extract_text_from_pdf(contents, file.filename, use_ocr)
                 
-                # Store in ChromaDB
-                if store_in_chromadb(page_identifier, text, pdf_name, page_number):
-                    stored_count += 1
+                # Store each page in ChromaDB and upload to S3
+                pdf_name = Path(file.filename).stem
+                print(f"\n  💾 Storing pages in ChromaDB and uploading to S3...")
                 
-                # Upload page image to S3
-                page = page_objects[page_identifier]
-                s3_url = upload_page_to_s3(page, page_identifier)
-                if s3_url:
-                    s3_upload_count += 1
-            
-            # Close the document
-            doc.close()
-            
-            results.update(extracted_text)
-            print(f"  ✅ Successfully extracted and stored {len(extracted_text)} pages from {file.filename}")
-            
-        except Exception as e:
-            error_msg = f"{file.filename}: {str(e)}"
-            errors.append(error_msg)
-            print(f"  ❌ Failed: {error_msg}")
+                for page_identifier, text in extracted_text.items():
+                    # Extract page number from identifier
+                    page_number = int(page_identifier.split('&')[1])
+                    
+                    # Store in ChromaDB
+                    if store_in_chromadb(page_identifier, text, pdf_name, page_number):
+                        stored_count += 1
+                    
+                    # Upload page image to S3
+                    page = page_objects[page_identifier]
+                    s3_url = upload_page_to_s3(page, page_identifier)
+                    if s3_url:
+                        s3_upload_count += 1
+                
+                # Close the document
+                doc.close()
+                
+                results.update(extracted_text)
+                print(f"  ✅ Successfully extracted and stored {len(extracted_text)} pages from {file.filename}")
+                
+            except Exception as e:
+                error_msg = f"{file.filename}: {str(e)}"
+                errors.append(error_msg)
+                print(f"  ❌ Failed: {error_msg}")
+        
+        response = {
+            "status": "success" if results else "failed",
+            "total_files_processed": len(files),
+            "total_pages_extracted": len(results),
+            "total_pages_stored_in_db": stored_count,
+            "total_pages_uploaded_to_s3": s3_upload_count,
+            "ocr_enabled": use_ocr,
+            "ocr_available": TESSERACT_FOUND,
+            "page_identifiers": list(results.keys()),
+            "pdf_s3_urls": pdf_s3_urls  # Full PDF S3 URLs
+        }
+        
+        if errors:
+            response["errors"] = errors
+        
+        print("\n" + "="*80)
+        print(f"🎉 Batch extraction complete!")
+        print(f"✅ Success: {len(results)} pages extracted")
+        print(f"💾 Stored: {stored_count} pages in ChromaDB")
+        print(f"📤 Uploaded: {s3_upload_count} pages to S3")
+        if errors:
+            print(f"⚠ Errors: {len(errors)} files failed")
+        print("="*80 + "\n")
     
-    response = {
-        "status": "success" if results else "failed",
-        "total_files_processed": len(files),
-        "total_pages_extracted": len(results),
-        "total_pages_stored_in_db": stored_count,
-        "total_pages_uploaded_to_s3": s3_upload_count,
-        "ocr_enabled": use_ocr,
-        "ocr_available": TESSERACT_FOUND,
-        "page_identifiers": list(results.keys()),
-        "pdf_s3_urls": pdf_s3_urls  # Full PDF S3 URLs
-    }
-    
-    if errors:
-        response["errors"] = errors
-    
-    print("\n" + "="*80)
-    print(f"🎉 Batch extraction complete!")
-    print(f"✅ Success: {len(results)} pages extracted")
-    print(f"💾 Stored: {stored_count} pages in ChromaDB")
-    print(f"📤 Uploaded: {s3_upload_count} pages to S3")
-    if errors:
-        print(f"⚠ Errors: {len(errors)} files failed")
-    print("="*80 + "\n")
-    
-    # Backup ChromaDB to S3 after extraction completes (ensures all pages are written)
-    if stored_count > 0 and s3_client is not None:
-        print("📤 Backing up ChromaDB after extraction completes...")
-        # Use a small delay to ensure all ChromaDB writes are flushed to disk
-        def delayed_backup():
-            time.sleep(2)  # Wait 2 seconds for ChromaDB to flush writes
-            upload_chromadb_to_s3()
-        threading.Thread(target=delayed_backup, daemon=True).start()
-    
-    return JSONResponse(content=response)
+        # Backup ChromaDB to S3 after extraction completes (ensures all pages are written)
+        if stored_count > 0 and s3_client is not None:
+            print("📤 Backing up ChromaDB after extraction completes...")
+            # Use a small delay to ensure all ChromaDB writes are flushed to disk
+            def delayed_backup():
+                time.sleep(2)  # Wait 2 seconds for ChromaDB to flush writes
+                upload_chromadb_to_s3()
+            threading.Thread(target=delayed_backup, daemon=True).start()
+        
+        return JSONResponse(content=response)
+    finally:
+        # Always reset extraction flag when done
+        with extraction_lock:
+            extraction_in_progress = False
 
 
 @app.get("/extract/status/{job_id}")
