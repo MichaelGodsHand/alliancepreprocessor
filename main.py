@@ -217,7 +217,7 @@ else:
         region_name=aws_region
     )
 
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "real-estate-brochures-tenori")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "alliancewidget")
 CHROMADB_S3_KEY = "chromadb_backup/chromadb.tar.gz"  # S3 key for ChromaDB backup
 CHROMADB_LOCAL_PATH = "./chroma_db"
 
