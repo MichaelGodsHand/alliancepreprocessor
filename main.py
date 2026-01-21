@@ -171,6 +171,11 @@ backup_lock = threading.Lock()  # Lock to prevent concurrent ChromaDB backups
 extraction_in_progress = False  # Flag to track if extraction is in progress
 extraction_lock = threading.Lock()  # Lock to protect extraction_in_progress flag
 
+# Cache for unique PDF names to avoid expensive collection.get() calls
+_cached_pdf_names = set()
+_pdf_names_cache_lock = threading.Lock()
+_pdf_names_cache_valid = False  # Flag to indicate if cache needs refresh
+
 
 @app.head("/health")
 async def health_check():
@@ -1142,6 +1147,8 @@ def store_in_chromadb(page_identifier, text, pdf_name, page_number):
             limit=1
         )
         
+        is_new_page = not existing['ids']
+        
         if existing['ids']:
             # Page exists, update it instead of creating duplicate
             print(f" (updating existing)...", end="", flush=True)
@@ -1170,6 +1177,11 @@ def store_in_chromadb(page_identifier, text, pdf_name, page_number):
                 ids=[doc_id]
             )
             print(" ✓ Stored")
+            
+            # Update PDF names cache when new PDF is added
+            global _cached_pdf_names, _pdf_names_cache_lock
+            with _pdf_names_cache_lock:
+                _cached_pdf_names.add(pdf_name)
         
         # Note: Backup is triggered after batch extraction completes, not after each page
         # This prevents race conditions and reduces S3 API calls
@@ -1784,18 +1796,12 @@ async def get_extraction_status(job_id: str):
 @app.post("/query")
 async def query_documents(request: QueryRequest):
     """
-    Query the stored PDF documents using GPT-4o, ChromaDB, and send results via WhatsApp and Email.
+    Query the stored PDF documents using GPT-4o and ChromaDB.
+    Returns RAG results without sending WhatsApp or Email messages for faster response times.
     """
     query = request.query
     user_number = request.number
     user_email = request.email
-    
-    # Validate that at least one contact method is provided
-    if not user_number and not user_email:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one of 'number' or 'email' must be provided"
-        )
     
     print("\n" + "="*80)
     print(f"🔍 Processing query: {query}")
@@ -1827,26 +1833,44 @@ async def query_documents(request: QueryRequest):
                 print(f"  🔍 Detected property: '{property_name}' → Filtering to PDF: {pdf_name}")
                 break
         
-        # If no specific property detected, check all stored PDFs to infer
+        # If no specific property detected, try fuzzy match using cached PDF names
+        # Skip this expensive operation if cache is empty to speed up queries
         if not pdf_name_filter:
-            # Get all unique PDF names from collection
-            all_results = collection.get(limit=1000)
             unique_pdf_names = set()
-            if all_results.get('metadatas'):
-                for meta in all_results['metadatas']:
-                    if meta.get('pdf_name'):
-                        unique_pdf_names.add(meta['pdf_name'])
-            
-            # Try fuzzy match on query text
-            for stored_pdf in unique_pdf_names:
-                pdf_lower = stored_pdf.lower().replace('-', ' ').replace('_', ' ')
-                # Check if any significant words from PDF name appear in query
-                pdf_words = pdf_lower.split()
-                query_words = query_lower.split()
-                if any(word in query_words for word in pdf_words if len(word) > 4):
-                    pdf_name_filter = stored_pdf
-                    print(f"  🔍 Matched query to PDF: {pdf_name_filter}")
-                    break
+            try:
+                # Use cached PDF names (much faster than fetching all documents)
+                # Declare as global to avoid UnboundLocalError
+                global _cached_pdf_names, _pdf_names_cache_valid, _pdf_names_cache_lock
+                
+                with _pdf_names_cache_lock:
+                    if not _pdf_names_cache_valid or not _cached_pdf_names:
+                        # Only fetch a small sample to get unique PDF names (much faster)
+                        # Limit to 50 for speed - we just need PDF names, not all documents
+                        sample_results = collection.get(limit=50)  # Small sample is much faster
+                        if sample_results.get('metadatas'):
+                            for meta in sample_results['metadatas']:
+                                if meta.get('pdf_name'):
+                                    unique_pdf_names.add(meta['pdf_name'])
+                        _cached_pdf_names = unique_pdf_names
+                        _pdf_names_cache_valid = True
+                    else:
+                        unique_pdf_names = _cached_pdf_names.copy()
+                
+                # Try fuzzy match on query text (only if we have PDF names)
+                if unique_pdf_names:
+                    for stored_pdf in unique_pdf_names:
+                        pdf_lower = stored_pdf.lower().replace('-', ' ').replace('_', ' ')
+                        # Check if any significant words from PDF name appear in query
+                        pdf_words = pdf_lower.split()
+                        query_words = query_lower.split()
+                        if any(word in query_words for word in pdf_words if len(word) > 4):
+                            pdf_name_filter = stored_pdf
+                            print(f"  🔍 Matched query to PDF: {pdf_name_filter}")
+                            break
+            except Exception as e:
+                print(f"  ⚠ PDF name detection skipped: {e}")
+                # Continue without PDF filter - query will search all PDFs
+                pass
         
         # Enhanced search query - add keywords that might help find relevant content
         enhanced_query = query
@@ -1860,7 +1884,7 @@ async def query_documents(request: QueryRequest):
         # Build query with optional PDF filter
         query_params = {
             'query_texts': [enhanced_query],
-            'n_results': 20  # Get more results to ensure we find relevant pages
+            'n_results': 10  # Reduced for faster queries
         }
         
         # Add PDF filter if detected
@@ -1876,12 +1900,7 @@ async def query_documents(request: QueryRequest):
             print(f"  ⚠ No documents found in ChromaDB")
             return JSONResponse(content={
                 "status": "no_results",
-                "summary": "No relevant documents found in the database.",
-                "pages": [],
-                "s3_images": [],
-                "compiled_pdf_url": None,
-                "whatsapp_status": {"status": "skipped", "reason": "No results"},
-                "email_status": {"status": "skipped", "reason": "No results"}
+                "summary": "No relevant documents found in the database."
             })
         
         documents = results['documents'][0]
@@ -1910,8 +1929,8 @@ async def query_documents(request: QueryRequest):
         # Sort by relevance (highest first) and take top results
         sorted_pages = sorted(seen_pages.items(), key=lambda x: x[1]['relevance'], reverse=True)
         
-        # Take top 15 unique pages
-        for page_id, page_data in sorted_pages[:15]:
+        # Take top 8 unique pages (reduced for faster processing)
+        for page_id, page_data in sorted_pages[:8]:
             deduplicated_docs.append(page_data['doc'])
             deduplicated_metas.append(page_data['meta'])
             deduplicated_distances.append(page_data['dist'])
@@ -1942,35 +1961,17 @@ async def query_documents(request: QueryRequest):
         # Query GPT-4o with structured output
         print(f"\n  🤖 Querying GPT-4o...")
         
-        system_prompt = """You are a helpful assistant that answers questions based on PDF document content.
-You MUST use the provided document excerpts to answer the user's query. 
-Your response MUST be in JSON format with exactly two fields:
-1. "summary": A comprehensive answer based ONLY on the provided document excerpts
-2. "pages_used": An array of page identifiers (e.g., ["palm-premiere-brochure&19", "palm-premiere-brochure&14"]) that you used from the provided excerpts
-
-CRITICAL RULES:
-- You MUST include ALL page identifiers that contain information relevant to answering the query
-- Even if information appears in multiple pages, include all those page identifiers
-- If the document excerpts contain relevant information, you MUST use it and list the source pages
-- Only exclude pages that have NO relevant information at all
-- Be thorough - if kitchen details are in page 19, you MUST include "palm-premiere-brochure&19" in pages_used"""
+        system_prompt = """Answer questions based on provided document excerpts. Return JSON with "summary" (your answer) and "pages_used" (array of page identifiers you used)."""
 
         user_prompt = f"""Query: "{query}"
-
-Below are document excerpts from a real estate brochure. Answer the query using ONLY information from these excerpts. Be comprehensive and include all relevant details.
 
 Document excerpts:
 {context}
 
-REQUIREMENTS:
-1. Extract ALL relevant information from the excerpts to answer: "{query}"
-2. List ALL page identifiers that contain information relevant to your answer
-3. Be thorough - include pages even if they only have partial information
-
-Respond in JSON format:
+Answer the query using ONLY the excerpts above. Return JSON:
 {{
-  "summary": "Your detailed answer based on the excerpts above. Include specific details, measurements, features mentioned.",
-  "pages_used": ["page-identifier-1", "page-identifier-2", ...]
+  "summary": "Your answer based on the excerpts",
+  "pages_used": ["page-id-1", "page-id-2"]
 }}"""
 
         response = openai_client.chat.completions.create(
@@ -1980,7 +1981,7 @@ Respond in JSON format:
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.3,  # Lower temperature for more consistent, factual responses
-            max_tokens=2000,  # Increased for more detailed answers
+            max_tokens=1000,  # Reduced for faster responses
             response_format={"type": "json_object"}
         )
         
@@ -1999,78 +2000,22 @@ Respond in JSON format:
             print(f"  → Returning no results (no fallback)")
             return JSONResponse(content={
                 "status": "no_results",
-                "summary": "No relevant documents found in the database for this query.",
-                "pages": [],
-                "s3_images": [],
-                "compiled_pdf_url": None,
-                "whatsapp_status": {"status": "skipped", "reason": "No results"},
-                "email_status": {"status": "skipped", "reason": "No results"}
+                "summary": "No relevant documents found in the database for this query."
             })
         
         print(f"  ✓ GPT-4o response generated")
         print(f"  📄 GPT-4o used {len(pages_actually_used)} out of {len(pages_used)} retrieved pages")
         
-        # Log which pages were actually used
-        for page in pages_actually_used:
-            print(f"    ✓ Used: {page}")
-        
-        # Fetch S3 URLs for the pages used
-        s3_images = []
-        if s3_client is not None:
-            print(f"\n  🔗 Fetching S3 image URLs...")
-            for page_identifier in pages_actually_used:
-                s3_key = f"{page_identifier}.png"
-                s3_url = f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/{s3_key}"
-                
-                # Verify if the object exists in S3 (optional but recommended)
-                try:
-                    s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-                    s3_images.append(s3_url)
-                    print(f"    ✓ Found: {s3_url}")
-                except ClientError:
-                    print(f"    ⚠ Not found in S3: {page_identifier}")
-        else:
-            print(f"\n  ⚠ S3 client not configured, skipping S3 URL fetching")
-        
-        # Create compiled PDF from images
-        compiled_pdf_url = None
-        # Use number or email for PDF filename (prefer number, fallback to email hash)
-        pdf_identifier = user_number if user_number else (user_email.split('@')[0] if user_email else "unknown")
-        if s3_client is not None and s3_images:
-            print(f"\n  📚 Creating compiled PDF...")
-            compiled_pdf_url = create_compiled_pdf_from_images(s3_images, pdf_identifier, query)
-        else:
-            print(f"\n  ⚠ Skipping compiled PDF creation (S3 not configured or no images)")
-        
-        # Start background thread for WhatsApp and Email (non-blocking)
-        if user_number or user_email:
-            print(f"\n  🔄 Starting background thread for message sending...")
-            background_thread = threading.Thread(
-                target=send_messages_background,
-                args=(user_number, user_email, summary, compiled_pdf_url, query),
-                daemon=True
-            )
-            background_thread.start()
-            print(f"  ✓ Background thread started (messages will be sent asynchronously)")
-        
+        # Note: S3 operations and PDF creation removed for faster response times
         print(f"\n{'='*80}")
         print(f"✅ Query completed successfully")
         print(f"📄 Pages retrieved: {len(pages_used)}, Pages used: {len(pages_actually_used)}")
-        print(f"🖼️  S3 images found: {len(s3_images)}")
-        print(f"📚 Compiled PDF: {'Created' if compiled_pdf_url else 'Failed'}")
-        print(f"📱 WhatsApp: Processing in background")
-        print(f"📧 Email: Processing in background")
         print(f"{'='*80}\n")
         
-        # Return response immediately (don't wait for WhatsApp/Email)
+        # Return simplified response with just summary
         return JSONResponse(content={
             "status": "success",
-            "summary": summary,
-            "pages": pages_actually_used,
-            "s3_images": s3_images,
-            "compiled_pdf_url": compiled_pdf_url,
-            "whatsapp_status": {"status": "processing", "message": "WhatsApp message is being sent in the background"},
-            "email_status": {"status": "processing", "message": "Email is being sent in the background"}
+            "summary": summary
         })
         
     except Exception as e:
